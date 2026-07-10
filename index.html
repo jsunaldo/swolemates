@@ -2772,6 +2772,21 @@ function boot(){
   renderTopbar();
   renderView();
   startSyncLoops();
+  maybeAskForPassphrase();
+}
+// First-run onboarding: without the passphrase nothing syncs, and the amber
+// "Locked" chip is easy to miss — so ask once, right after boot. Declining
+// leaves the chip as the retry path.
+function maybeAskForPassphrase(){
+  if (getWriteKey() || localStorage.getItem('sm_keyPrompted')) return;
+  localStorage.setItem('sm_keyPrompted', '1');
+  setTimeout(() => {
+    promptDialog({ title: 'Enter sync passphrase', label: 'Connects this device to your shared plans', inputType: 'password' }).then((val) => {
+      if (val == null || !val.trim()) return;
+      setWriteKey(val.trim());
+      pullAndMerge().then(() => { pushDirty(); renderView(); });
+    });
+  }, 600);
 }
 function init(){
   loadAll();
