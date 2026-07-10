@@ -190,6 +190,7 @@ textarea.input{min-height:60px;resize:vertical;}
 .dot{width:22px;height:22px;border-radius:50%;border:2px solid var(--border-strong);position:relative;flex:none;}
 .dot.done{background:var(--green);border-color:var(--green);}
 .dot.planned{background:transparent;border-color:var(--text-dim);}
+.dot.optional{background:transparent;border:2px dotted var(--text-faint);}
 .dot.off{background:transparent;border:2px dashed var(--border-strong);}
 .dot.missed{background:rgba(255,69,58,0.18);border-color:var(--red);}
 .dot.today-ring{box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--accent-hover);}
@@ -606,19 +607,77 @@ const SEED_EXERCISES = [
   ['Nordic Curl', 'bodyweight', null], ['Pull-ups', 'bodyweight', null], ['Push-ups', 'bodyweight', null],
   ['Dips', 'bodyweight', null], ['Hanging Knee Raise', 'bodyweight', null], ['Ab Wheel Rollout', 'bodyweight', null],
   ['Plank', 'time', 'sec'], ['Wall Sit', 'time', 'sec'],
-  ['Row Erg', 'distance', 'm'], ['Bike Erg', 'distance', 'cal'], ['Incline Walk', 'time', 'min']
+  ['Row Erg', 'distance', 'm'], ['Bike Erg', 'distance', 'cal'], ['Incline Walk', 'time', 'min'],
+  // FBA (Ryan Fischer Full Body Aesthetics) movements + optional-day activities
+  ['Incline Barbell Bench Press', 'weight', 5], ['Rack Pull', 'weight', 5],
+  ['Barbell Skull Crusher', 'weight', 5], ['Barbell Bicep Curl', 'weight', 5],
+  ['Incline DB Curl', 'weight', 5], ['DB Lateral Raise', 'weight', 5],
+  ['DB Reverse Fly', 'weight', 5], ['Barbell Tricep Extension', 'weight', 5],
+  ['Zottman Curl', 'weight', 5], ['Incline DB Fly', 'weight', 5],
+  ['Run', 'distance', 'mi'], ['Pilates', 'time', 'min']
 ];
 function seedIfNeeded(){
-  if (Object.keys(state.shared.library).length > 0) return;
+  // Additive, per-entry: any seed the library doesn't know yet gets added, so new
+  // seeds reach existing installs too. Deterministic ids mean two devices seeding
+  // independently produce IDENTICAL entities and the merge unions cleanly.
+  // A tombstoned seed (user archived it) still occupies its id, so it stays gone.
+  let added = false;
   SEED_EXERCISES.forEach(([name, type, extra]) => {
-    const ex = { id: uuid(), name, type, updatedAt: nowISO() };
+    const slug = 'seed-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    if (state.shared.library[slug]) return;
+    const ex = { id: slug, name, type, updatedAt: nowISO() };
     if (type === 'weight') ex.increment = extra || 5;
     if (type === 'time' || type === 'distance') ex.unit = extra;
     state.shared.library[ex.id] = ex;
+    added = true;
   });
+  if (!added) return;
   state.shared.updatedAt = nowISO();
   saveShared();
   markDirty('shared');
+}
+
+// Heal duplicate exercises left behind by pre-v2 devices that seeded random-id
+// copies of the library: when a seed-id exercise and another exercise share a
+// name, remap every plan/session reference to the seed one and tombstone the
+// duplicate. Deterministic (seed id always wins), so concurrent devices converge.
+function dedupeSeedLibrary(){
+  const byName = {};
+  Object.values(state.shared.library).forEach((ex) => {
+    if (ex.deleted) return;
+    const key = (ex.name || '').trim().toLowerCase();
+    (byName[key] = byName[key] || []).push(ex);
+  });
+  const remap = {};
+  Object.values(byName).forEach((list) => {
+    if (list.length < 2) return;
+    const keeper = list.find((e) => String(e.id).indexOf('seed-') === 0);
+    if (!keeper) return;
+    list.forEach((e) => {
+      if (e.id === keeper.id) return;
+      remap[e.id] = keeper.id;
+      e.deleted = true; e.updatedAt = nowISO();
+    });
+  });
+  if (!Object.keys(remap).length) return;
+  state.shared.updatedAt = nowISO();
+  saveShared(); markDirty('shared');
+  ['jason', 'shannon'].forEach((person) => {
+    let touched = false;
+    Object.values(state.users[person].plans).forEach((p) => {
+      DAY_KEYS.forEach((dk) => {
+        (((p.days || {})[dk] || {}).items || []).forEach((it) => {
+          if (remap[it.exId]) { it.exId = remap[it.exId]; p.updatedAt = nowISO(); touched = true; }
+        });
+      });
+    });
+    Object.values(state.users[person].sessions).forEach((s) => {
+      (s.entries || []).forEach((en) => {
+        if (remap[en.exId]) { en.exId = remap[en.exId]; s.updatedAt = nowISO(); touched = true; }
+      });
+    });
+    if (touched) { state.users[person].updatedAt = nowISO(); saveUser(person); markDirty(person); }
+  });
 }
 
 function loadAll(){
@@ -628,6 +687,7 @@ function loadAll(){
   state.users.shannon = loadUserBlob('shannon');
   state.shared = loadSharedBlob();
   seedIfNeeded();
+  dedupeSeedLibrary();
   state.ui.planPerson = state.profile || 'jason';
   state.ui.historyPerson = state.profile || 'jason';
   state.ui.progressPerson = state.profile || 'jason';
@@ -704,6 +764,7 @@ function pullAndMerge(keys){
   }).catch((e) => { hadError = e; }));
   return Promise.all(tasks).then(() => {
     state.sync.pulling = false;
+    dedupeSeedLibrary(); // heal any random-id duplicates a pre-v2 device pushed
     if (hadError && hadError.code === 401) setSyncStatus('locked');
     else if (hadError) setSyncStatus('offline');
     else setSyncStatus('synced');
@@ -1246,6 +1307,8 @@ function dayStatus(person, weekStartKey, dKey, dateObj){
   const session = sessionForDate(person, dateKey(dateObj));
   if (session && session.finishedAt) return 'done';
   if (!day || day.rest || !(day.items && day.items.length)) return 'off';
+  // Optional days (runs, pilates, …) are never "missed" — no red dot, no streak damage.
+  if (day.optional) return dateObj < todayDate() ? 'off' : 'optional';
   if (dateObj < todayDate()) return 'missed';
   return 'planned';
 }
@@ -1256,7 +1319,7 @@ function weekPlanComplete(person, weekStartKey){
   let hasAnyPlanned = false;
   for (let i = 0; i < 7; i++){
     const day = plan.days && plan.days[DAY_KEYS[i]];
-    if (day && !day.rest && day.items && day.items.length){
+    if (day && !day.rest && !day.optional && day.items && day.items.length){
       hasAnyPlanned = true;
       const d = addDays(monday, i);
       const session = sessionForDate(person, dateKey(d));
@@ -1386,7 +1449,7 @@ function renderSelfTodayCard(person){
     return '<div class="empty-card"><p style="font-weight:700;color:var(--text);margin-bottom:8px;">No plan for today</p><p style="margin-bottom:14px;">Build this week’s plan to get suggested weights.</p><button class="btn btn-primary" data-action="switchTab" data-tab="plan" type="button">Go to Plan</button></div>';
   }
   return '<div class="card ' + edge + '">' +
-    '<div class="card-title">' + escapeHtml(day.focus || 'Workout') + '</div>' +
+    '<div class="row-between"><div class="card-title">' + escapeHtml(day.focus || 'Workout') + '</div>' + (day.optional ? '<span class="chip">Optional</span>' : '') + '</div>' +
     '<div class="card-sub">' + day.items.length + ' exercise' + (day.items.length > 1 ? 's' : '') + '</div>' +
     planItemsPreviewHTML(person, day) +
     '<button class="btn btn-primary btn-block" style="margin-top:14px;" data-action="startWorkout" data-day="' + dKey + '" type="button">Start Workout</button>' +
@@ -1415,7 +1478,7 @@ function renderPartnerCard(person){
     return '<div class="card card-tight" style="border-left:3px solid ' + p.color + ';"><span class="card-sub">Nothing planned today</span></div>';
   }
   return '<div class="card card-tight" style="border-left:3px solid ' + p.color + ';">' +
-    '<div class="row-between"><span style="font-weight:700;font-size:14px;">' + escapeHtml(day.focus || 'Workout') + '</span><span class="chip">Not yet</span></div>' +
+    '<div class="row-between"><span style="font-weight:700;font-size:14px;">' + escapeHtml(day.focus || 'Workout') + '</span><span class="chip">' + (day.optional ? 'Optional' : 'Not yet') + '</span></div>' +
   '</div>';
 }
 
@@ -1430,7 +1493,7 @@ function cloneDaysStructure(days, keepTarget){
   DAY_KEYS.forEach((k) => {
     const d = (days && days[k]) || { rest: false, focus: '', items: [] };
     out[k] = {
-      rest: !!d.rest, focus: d.focus || '',
+      rest: !!d.rest, optional: !!d.optional, focus: d.focus || '',
       items: (d.items || []).map((it) => ({
         id: uuid(), exId: it.exId, sets: it.sets, reps: it.reps, note: it.note || '',
         targetWeight: keepTarget ? (it.targetWeight != null ? it.targetWeight : null) : null
@@ -1495,6 +1558,10 @@ function renderDayCard(person, plan, dKey, dateObj){
       '<span class="day-name">' + DAY_LABELS[dKey] + '</span>' +
       '<span class="day-date">' + fmtShortDate(dateObj) + (isToday ? ' · Today' : '') + '</span>' +
       '<div class="spacer"></div>' +
+      (day.rest ? '' :
+        '<span class="card-sub" style="margin-right:4px;">Optional</span>' +
+        '<label class="switch"><input type="checkbox" data-field="optional" data-day="' + dKey + '" ' + (day.optional ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
+        '<span style="width:10px;"></span>') +
       '<span class="card-sub" style="margin-right:4px;">Rest</span>' +
       '<label class="switch"><input type="checkbox" data-field="rest" data-day="' + dKey + '" ' + (day.rest ? 'checked' : '') + '><span class="track"><span class="knob"></span></span></label>' +
     '</div>' +
@@ -1539,6 +1606,7 @@ function handlePlanFieldChange(el){
   if (!plan) return;
   const day = plan.days[dKey] || (plan.days[dKey] = { rest: false, focus: '', items: [] });
   if (field === 'rest'){ day.rest = el.checked; }
+  else if (field === 'optional'){ day.optional = el.checked; }
   else if (field === 'focus'){ day.focus = el.value; }
   else if (itemId){
     const item = day.items.find((i) => i.id === itemId);
@@ -1842,7 +1910,7 @@ function consistencyPct(person){
     if (!plan) continue;
     DAY_KEYS.forEach((dk, i) => {
       const day = plan.days[dk];
-      if (day && !day.rest && day.items && day.items.length){
+      if (day && !day.rest && !day.optional && day.items && day.items.length){
         const d = addDays(monday, i);
         if (d > today) return;
         const session = sessionForDate(person, dateKey(d));
