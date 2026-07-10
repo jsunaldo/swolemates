@@ -1,7 +1,7 @@
 // SwoleMates service worker — cache-first for same-origin assets, network-first for
 // navigation (falling back to cache offline). Never caches the sync worker origin.
-const CACHE_NAME = 'swolemates-v3';
-const PRECACHE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+const CACHE_NAME = 'swolemates-v4';
+const PRECACHE = ['./', './index.html', './manifest.json', './icon-192-v3.png', './icon-512-v3.png'];
 const SYNC_ORIGIN = 'workers.dev';
 
 self.addEventListener('install', (event) => {
